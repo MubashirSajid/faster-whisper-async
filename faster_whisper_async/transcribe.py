@@ -9,6 +9,7 @@ from inspect import signature
 from math import ceil
 from typing import BinaryIO, Iterable, List, Optional, Tuple, Union
 from warnings import warn
+import asyncio
 
 import ctranslate2
 import numpy as np
@@ -16,17 +17,12 @@ import tokenizers
 
 from tqdm import tqdm
 
-from faster_whisper.audio import decode_audio, pad_or_trim
-from faster_whisper.feature_extractor import FeatureExtractor
-from faster_whisper.tokenizer import _LANGUAGE_CODES, Tokenizer
-from faster_whisper.utils import download_model, format_timestamp, get_end, get_logger
-from faster_whisper.vad import (
-    SpeechTimestampsMap,
-    VadOptions,
-    collect_chunks,
-    get_speech_timestamps,
-    merge_segments,
-)
+from faster_whisper_async.audio import decode_audio_async, pad_or_trim
+from faster_whisper_async.feature_extractor import FeatureExtractor
+from faster_whisper_async.tokenizer import _LANGUAGE_CODES, Tokenizer
+from faster_whisper_async.utils import download_model, format_timestamp, get_end, get_logger
+from faster_whisper_async.vad import *
+
 
 
 @dataclass
@@ -109,6 +105,7 @@ class TranscriptionInfo:
     vad_options: VadOptions
 
 
+
 class BatchedInferencePipeline:
     def __init__(
         self,
@@ -118,6 +115,7 @@ class BatchedInferencePipeline:
         self.last_speech_timestamp = 0.0
 
     def forward(self, features, tokenizer, chunks_metadata, options):
+        # This method is assumed to be fast compared to the VAD and file I/O steps.
         encoder_output, outputs = self.generate_segment_batched(
             features, tokenizer, options
         )
@@ -178,15 +176,13 @@ class BatchedInferencePipeline:
         tokenizer: Tokenizer,
         options: TranscriptionOptions,
     ):
+        # (Synchronous helper—assumed to run fast.)
         batch_size = features.shape[0]
 
         prompt = self.model.get_prompt(
             tokenizer,
-            previous_tokens=(
-                tokenizer.encode(options.initial_prompt)
-                if options.initial_prompt is not None
-                else []
-            ),
+            previous_tokens=(tokenizer.encode(options.initial_prompt)
+                             if options.initial_prompt is not None else []),
             without_timestamps=options.without_timestamps,
             hotwords=options.hotwords,
         )
@@ -201,10 +197,7 @@ class BatchedInferencePipeline:
                 f"The length of the prompt is {len(prompt)}, and the `max_new_tokens` "
                 f"{max_length - len(prompt)}. Thus, the combined length of the prompt "
                 f"and `max_new_tokens` is: {max_length}. This exceeds the "
-                f"`max_length` of the Whisper model: {self.model.max_length}. "
-                "You should either reduce the length of your prompt, or "
-                "reduce the value of `max_new_tokens`, "
-                f"so that their combined length is less that {self.model.max_length}."
+                f"`max_length` of the Whisper model: {self.model.max_length}."
             )
 
         encoder_output = self.model.encode(features)
@@ -216,7 +209,6 @@ class BatchedInferencePipeline:
                 for segment_langs in self.model.model.detect_language(encoder_output)
             ]
             language_token_index = prompt.index(tokenizer.language)
-
             for i, language_token in enumerate(language_tokens):
                 prompts[i][language_token_index] = language_token
 
@@ -238,10 +230,8 @@ class BatchedInferencePipeline:
 
         output = []
         for result in results:
-            # return scores
             seq_len = len(result.sequences_ids[0])
-            cum_logprob = result.scores[0] * (seq_len**options.length_penalty)
-
+            cum_logprob = result.scores[0] * (seq_len ** options.length_penalty)
             output.append(
                 dict(
                     avg_logprob=cum_logprob / (seq_len + 1),
@@ -249,10 +239,9 @@ class BatchedInferencePipeline:
                     tokens=result.sequences_ids[0],
                 )
             )
-
         return encoder_output, output
 
-    def transcribe(
+    async def transcribe(
         self,
         audio: Union[str, BinaryIO, np.ndarray],
         language: Optional[str] = None,
@@ -264,14 +253,7 @@ class BatchedInferencePipeline:
         length_penalty: float = 1,
         repetition_penalty: float = 1,
         no_repeat_ngram_size: int = 0,
-        temperature: Union[float, List[float], Tuple[float, ...]] = [
-            0.0,
-            0.2,
-            0.4,
-            0.6,
-            0.8,
-            1.0,
-        ],
+        temperature: Union[float, List[float], Tuple[float, ...]] = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
         compression_ratio_threshold: Optional[float] = 2.4,
         log_prob_threshold: Optional[float] = -1.0,
         no_speech_threshold: Optional[float] = 0.6,
@@ -281,209 +263,98 @@ class BatchedInferencePipeline:
         prefix: Optional[str] = None,
         suppress_blank: bool = True,
         suppress_tokens: Optional[List[int]] = [-1],
-        without_timestamps: bool = True,
+        without_timestamps: bool = False,
         max_initial_timestamp: float = 1.0,
         word_timestamps: bool = False,
         prepend_punctuations: str = "\"'“¿([{-",
         append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
         multilingual: bool = False,
-        vad_filter: bool = True,
+        vad_filter: bool = False,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
         max_new_tokens: Optional[int] = None,
         chunk_length: Optional[int] = None,
-        clip_timestamps: Optional[List[dict]] = None,
+        clip_timestamps: Union[str, List[float]] = "0",
         hallucination_silence_threshold: Optional[float] = None,
         batch_size: int = 8,
         hotwords: Optional[str] = None,
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
-        """transcribe audio in chunks in batched fashion and return with language info.
-
-        Arguments:
-            audio: Path to the input file (or a file-like object), or the audio waveform.
-            language: The language spoken in the audio. It should be a language code such
-                as "en" or "fr". If not set, the language will be detected in the first 30 seconds
-                of audio.
-            task: Task to execute (transcribe or translate).
-            log_progress: whether to show progress bar or not.
-            beam_size: Beam size to use for decoding.
-            best_of: Number of candidates when sampling with non-zero temperature.
-            patience: Beam search patience factor.
-            length_penalty: Exponential length penalty constant.
-            repetition_penalty: Penalty applied to the score of previously generated tokens
-                (set > 1 to penalize).
-            no_repeat_ngram_size: Prevent repetitions of ngrams with this size (set 0 to disable).
-            temperature: Temperature for sampling. If a list or tuple is passed,
-                only the first value is used.
-            initial_prompt: Optional text string or iterable of token ids to provide as a
-                prompt for the each window.
-            suppress_blank: Suppress blank outputs at the beginning of the sampling.
-            suppress_tokens: List of token IDs to suppress. -1 will suppress a default set
-                of symbols as defined in `tokenizer.non_speech_tokens()`.
-            without_timestamps: Only sample text tokens.
-            word_timestamps: Extract word-level timestamps using the cross-attention pattern
-                and dynamic time warping, and include the timestamps for each word in each segment.
-                Set as False.
-            prepend_punctuations: If word_timestamps is True, merge these punctuation symbols
-                with the next word
-            append_punctuations: If word_timestamps is True, merge these punctuation symbols
-                with the previous word
-            multilingual: Perform language detection on every segment.
-            vad_filter: Enable the voice activity detection (VAD) to filter out parts of the audio
-                without speech. This step is using the Silero VAD model
-                https://github.com/snakers4/silero-vad.
-            vad_parameters: Dictionary of Silero VAD parameters or VadOptions class (see available
-                parameters and default values in the class `VadOptions`).
-            max_new_tokens: Maximum number of new tokens to generate per-chunk. If not set,
-                the maximum will be set by the default max_length.
-            chunk_length: The length of audio segments. If it is not None, it will overwrite the
-                default chunk_length of the FeatureExtractor.
-            clip_timestamps: Optionally provide list of dictionaries each containing "start" and
-                "end" keys that specify the start and end of the voiced region within
-                `chunk_length` boundary. vad_filter will be ignored if clip_timestamps is used.
-            batch_size: the maximum number of parallel requests to model for decoding.
-            hotwords:
-                Hotwords/hint phrases to the model. Has no effect if prefix is not None.
-            language_detection_threshold: If the maximum probability of the language tokens is
-                higher than this value, the language is detected.
-            language_detection_segments: Number of segments to consider for the language detection.
-
-        Unused Arguments
-            compression_ratio_threshold: If the gzip compression ratio is above this value,
-                treat as failed.
-            log_prob_threshold: If the average log probability over sampled tokens is
-                below this value, treat as failed.
-            no_speech_threshold: If the no_speech probability is higher than this value AND
-                the average log probability over sampled tokens is below `log_prob_threshold`,
-                consider the segment as silent.
-            condition_on_previous_text: If True, the previous output of the model is provided
-                as a prompt for the next window; disabling may make the text inconsistent across
-                windows, but the model becomes less prone to getting stuck in a failure loop,
-                such as repetition looping or timestamps going out of sync. Set as False
-            prompt_reset_on_temperature: Resets prompt if temperature is above this value.
-                Arg has effect only if condition_on_previous_text is True. Set at 0.5
-            prefix: Optional text to provide as a prefix at the beginning of each window.
-            max_initial_timestamp: The initial timestamp cannot be later than this, set at 0.0.
-            hallucination_silence_threshold: Optional[float]
-                When word_timestamps is True, skip silent periods longer than this threshold
-                (in seconds) when a possible hallucination is detected. set as None.
-        Returns:
-          A tuple with:
-
-            - a generator over transcribed segments
-            - an instance of TranscriptionInfo
         """
+        Asynchronously transcribes the given audio and returns a generator over segments plus transcription info.
+        """
+        sampling_rate = self.feature_extractor.sampling_rate
 
-        sampling_rate = self.model.feature_extractor.sampling_rate
-
-        if multilingual and not self.model.model.is_multilingual:
-            self.model.logger.warning(
-                "The current model is English-only but the multilingual parameter is set to"
-                "True; setting to False instead."
+        if multilingual and not self.model.is_multilingual:
+            self.logger.warning(
+                "The current model is English-only but the multilingual parameter is set to True; setting to False instead."
             )
             multilingual = False
 
+        # Use the async decoder.
         if not isinstance(audio, np.ndarray):
-            audio = decode_audio(audio, sampling_rate=sampling_rate)
+            audio = await decode_audio_async(audio, sampling_rate=sampling_rate)
+
         duration = audio.shape[0] / sampling_rate
+        duration_after_vad = duration
 
-        self.model.logger.info(
-            "Processing audio with duration %s", format_timestamp(duration)
-        )
+        self.logger.info("Processing audio with duration %s", format_timestamp(duration))
 
-        chunk_length = chunk_length or self.model.feature_extractor.chunk_length
-        # if no segment split is provided, use vad_model and generate segments
-        if not clip_timestamps:
-            if vad_filter:
-                if vad_parameters is None:
-                    vad_parameters = VadOptions(
-                        max_speech_duration_s=chunk_length,
-                        min_silence_duration_ms=160,
-                    )
-                elif isinstance(vad_parameters, dict):
-                    if "max_speech_duration_s" in vad_parameters.keys():
-                        vad_parameters.pop("max_speech_duration_s")
+        # If VAD filtering is enabled and no clip timestamps are provided (clip_timestamps == "0")
+        if vad_filter and clip_timestamps == "0":
+            if vad_parameters is None:
+                vad_parameters = VadOptions()
+            elif isinstance(vad_parameters, dict):
+                vad_parameters = VadOptions(**vad_parameters)
+            # Use the asynchronous VAD wrappers
+            speech_chunks = await async_get_speech_timestamps(audio, vad_parameters, sampling_rate)
+            audio_chunks, chunks_metadata = await async_collect_chunks(audio, speech_chunks, sampling_rate)
+            # Concatenate the chunks (this is fast; it runs on CPU)
+            audio = np.concatenate(audio_chunks, axis=0)
+            duration_after_vad = audio.shape[0] / sampling_rate
 
-                    vad_parameters = VadOptions(
-                        **vad_parameters, max_speech_duration_s=chunk_length
-                    )
+            self.logger.info(
+                "VAD filter removed %s of audio",
+                format_timestamp(duration - duration_after_vad),
+            )
 
-                active_segments = get_speech_timestamps(audio, vad_parameters)
-                clip_timestamps = merge_segments(active_segments, vad_parameters)
-            # run the audio if it is less than 30 sec even without clip_timestamps
-            elif duration < chunk_length:
-                clip_timestamps = [{"start": 0, "end": audio.shape[0]}]
-            else:
-                raise RuntimeError(
-                    "No clip timestamps found. "
-                    "Set 'vad_filter' to True or provide 'clip_timestamps'."
-                )
+        # Extract features (synchronous step may be offloaded if needed)
+        features = self.feature_extractor(audio, chunk_length=chunk_length)
 
-        duration_after_vad = (
-            sum((segment["end"] - segment["start"]) for segment in clip_timestamps)
-            / sampling_rate
-        )
-
-        self.model.logger.info(
-            "VAD filter removed %s of audio",
-            format_timestamp(duration - duration_after_vad),
-        )
-
-        audio_chunks, chunks_metadata = collect_chunks(audio, clip_timestamps)
-        features = (
-            [self.model.feature_extractor(chunk)[..., :-1] for chunk in audio_chunks]
-            if duration_after_vad
-            else []
-        )
-
+        encoder_output = None
         all_language_probs = None
-        # detecting the language if not provided
+
+        # Language detection if language is not provided.
         if language is None:
-            if not self.model.model.is_multilingual:
+            if not self.model.is_multilingual:
                 language = "en"
                 language_probability = 1
             else:
-                (
-                    language,
-                    language_probability,
-                    all_language_probs,
-                ) = self.model.detect_language(
-                    features=np.concatenate(
-                        features
-                        + [
-                            np.full((self.model.model.n_mels, 1), -1.5, dtype="float32")
-                        ],
-                        axis=1,
-                    ),  # add a dummy feature to account for empty audio
+                # Use a slice of features for language detection.
+                start_timestamp = (
+                    float(clip_timestamps.split(",")[0])
+                    if isinstance(clip_timestamps, str)
+                    else clip_timestamps[0]
+                )
+                content_frames = features.shape[-1] - 1
+                seek = int(start_timestamp * self.frames_per_second) if start_timestamp * self.frames_per_second < content_frames else 0
+                language, language_probability, all_language_probs = self.detect_language(
+                    features=features[..., seek:],
                     language_detection_segments=language_detection_segments,
                     language_detection_threshold=language_detection_threshold,
                 )
-
-                self.model.logger.info(
-                    "Detected language '%s' with probability %.2f",
-                    language,
-                    language_probability,
-                )
+                self.logger.info("Detected language '%s' with probability %.2f", language, language_probability)
         else:
-            if not self.model.model.is_multilingual and language != "en":
-                self.model.logger.warning(
-                    "The current model is English-only but the language parameter is set to '%s'; "
-                    "using 'en' instead." % language
-                )
+            if not self.model.is_multilingual and language != "en":
+                self.logger.warning("The current model is English-only but the language parameter is set to '%s'; using 'en' instead." % language)
                 language = "en"
-
             language_probability = 1
 
         tokenizer = Tokenizer(
-            self.model.hf_tokenizer,
-            self.model.model.is_multilingual,
+            self.hf_tokenizer,
+            self.model.is_multilingual,
             task=task,
             language=language,
-        )
-
-        features = (
-            np.stack([pad_or_trim(feature) for feature in features]) if features else []
         )
 
         options = TranscriptionOptions(
@@ -496,32 +367,30 @@ class BatchedInferencePipeline:
             log_prob_threshold=log_prob_threshold,
             no_speech_threshold=no_speech_threshold,
             compression_ratio_threshold=compression_ratio_threshold,
-            temperatures=(
-                temperature[:1]
-                if isinstance(temperature, (list, tuple))
-                else [temperature]
-            ),
+            condition_on_previous_text=condition_on_previous_text,
+            prompt_reset_on_temperature=prompt_reset_on_temperature,
+            temperatures=(temperature if isinstance(temperature, (list, tuple)) else [temperature]),
             initial_prompt=initial_prompt,
             prefix=prefix,
             suppress_blank=suppress_blank,
-            suppress_tokens=(
-                get_suppressed_tokens(tokenizer, suppress_tokens)
-                if suppress_tokens
-                else suppress_tokens
-            ),
+            suppress_tokens=(get_suppressed_tokens(tokenizer, suppress_tokens) if suppress_tokens else suppress_tokens),
+            without_timestamps=without_timestamps,
+            max_initial_timestamp=max_initial_timestamp,
+            word_timestamps=word_timestamps,
             prepend_punctuations=prepend_punctuations,
             append_punctuations=append_punctuations,
-            max_new_tokens=max_new_tokens,
-            hotwords=hotwords,
-            word_timestamps=word_timestamps,
-            hallucination_silence_threshold=None,
-            condition_on_previous_text=False,
-            clip_timestamps=clip_timestamps,
-            prompt_reset_on_temperature=0.5,
             multilingual=multilingual,
-            without_timestamps=without_timestamps,
-            max_initial_timestamp=0.0,
+            max_new_tokens=max_new_tokens,
+            clip_timestamps=clip_timestamps,
+            hallucination_silence_threshold=hallucination_silence_threshold,
+            hotwords=hotwords,
         )
+
+        # Generate segments using an asynchronous generator.
+        segments = self._batched_segments_generator(features, tokenizer, None, batch_size, options, encoder_output)
+
+        if vad_filter and clip_timestamps == "0":
+            segments = restore_speech_timestamps(segments, speech_chunks, sampling_rate)
 
         info = TranscriptionInfo(
             language=language,
@@ -533,24 +402,19 @@ class BatchedInferencePipeline:
             all_language_probs=all_language_probs,
         )
 
-        segments = self._batched_segments_generator(
-            features,
-            tokenizer,
-            chunks_metadata,
-            batch_size,
-            options,
-            log_progress,
-        )
-
         return segments, info
 
-    def _batched_segments_generator(
+    async def _batched_segments_generator(
         self, features, tokenizer, chunks_metadata, batch_size, options, log_progress
     ):
+        # Convert this generator into an async generator.
         pbar = tqdm(total=len(features), disable=not log_progress, position=0)
         seg_idx = 0
+        # Process batches asynchronously by offloading the forward pass to a thread.
         for i in range(0, len(features), batch_size):
-            results = self.forward(
+            # Offload heavy synchronous forward() call.
+            results = await asyncio.to_thread(
+                self.forward,
                 features[i : i + batch_size],
                 tokenizer,
                 chunks_metadata[i : i + batch_size],
@@ -563,13 +427,11 @@ class BatchedInferencePipeline:
                     yield Segment(
                         seek=segment["seek"],
                         id=seg_idx,
-                        text=segment["text"],
+                        text=tokenizer.decode(segment["tokens"]),
                         start=round(segment["start"], 3),
                         end=round(segment["end"], 3),
                         words=(
-                            None
-                            if not options.word_timestamps
-                            else [Word(**word) for word in segment["words"]]
+                            None if not options.word_timestamps else [Word(**word) for word in segment.get("words", [])]
                         ),
                         tokens=segment["tokens"],
                         avg_logprob=segment["avg_logprob"],
@@ -577,9 +439,8 @@ class BatchedInferencePipeline:
                         compression_ratio=segment["compression_ratio"],
                         temperature=options.temperatures[0],
                     )
-
                 pbar.update(1)
-
+                await asyncio.sleep(0)  # yield control
         pbar.close()
         self.last_speech_timestamp = 0.0
 
@@ -830,8 +691,8 @@ class WhisperModel:
             )
             multilingual = False
 
-        if not isinstance(audio, np.ndarray):
-            audio = decode_audio(audio, sampling_rate=sampling_rate)
+        # if not isinstance(audio, np.ndarray):
+        #     audio = await decode_audio_async(audio, sampling_rate=sampling_rate)
 
         duration = audio.shape[0] / sampling_rate
         duration_after_vad = duration

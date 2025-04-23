@@ -1,3 +1,4 @@
+import asyncio
 import numpy as np
 
 
@@ -156,7 +157,7 @@ class FeatureExtractor:
         # Calculate the number of frames
         n_frames = 1 + (length - n_fft) // hop_length
 
-        # Time to columns
+        # Time to columns using stride tricks
         input_array = np.lib.stride_tricks.as_strided(
             input_array,
             (batch, n_frames, n_fft),
@@ -199,7 +200,6 @@ class FeatureExtractor:
         """
         Compute the log-Mel spectrogram of the provided audio.
         """
-
         if chunk_length is not None:
             self.n_samples = chunk_length * self.sampling_rate
             self.nb_max_frames = self.n_samples // self.hop_length
@@ -212,14 +212,14 @@ class FeatureExtractor:
 
         window = np.hanning(self.n_fft + 1)[:-1].astype("float32")
 
-        stft = self.stft(
+        stft_result = self.stft(
             waveform,
             self.n_fft,
             self.hop_length,
             window=window,
             return_complex=True,
         ).astype("complex64")
-        magnitudes = np.abs(stft[..., :-1]) ** 2
+        magnitudes = np.abs(stft_result[..., :-1]) ** 2
 
         mel_spec = self.mel_filters @ magnitudes
 
@@ -228,3 +228,11 @@ class FeatureExtractor:
         log_spec = (log_spec + 4.0) / 4.0
 
         return log_spec
+
+    async def async_extract(self, waveform: np.ndarray, padding=160, chunk_length=None):
+        """
+        Asynchronously compute the log-Mel spectrogram by offloading the heavy,
+        blocking computation to a separate thread.
+        """
+        return await asyncio.to_thread(self.__call__, waveform, padding, chunk_length)
+

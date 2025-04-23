@@ -12,7 +12,7 @@ def get_long_description():
 
 
 def get_project_version():
-    version_path = os.path.join(base_dir, "faster_whisper", "version.py")
+    version_path = os.path.join(base_dir, "faster_whisper_async", "version.py")
     version = {}
     with open(version_path, encoding="utf-8") as fp:
         exec(fp.read(), version)
@@ -30,7 +30,7 @@ conversion_requires = get_requirements(
 )
 
 setup(
-    name="faster-whisper",
+    name="faster-whisper-async",
     version=get_project_version(),
     license="MIT",
     description="Faster Whisper transcription with CTranslate2",

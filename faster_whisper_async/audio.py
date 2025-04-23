@@ -11,6 +11,7 @@ import io
 import itertools
 
 from typing import BinaryIO, Union
+import asyncio
 
 import av
 import numpy as np
@@ -121,3 +122,22 @@ def pad_or_trim(array, length: int = 3000, *, axis: int = -1):
         array = np.pad(array, pad_widths)
 
     return array
+
+
+async def decode_audio_async(
+    input_file: Union[str, BinaryIO],
+    sampling_rate: int = 16000,
+    split_stereo: bool = False,
+):
+    """
+    Asynchronously decodes the audio by offloading the blocking operations to a separate thread.
+    
+    Args:
+      input_file: Path to the input file or a file-like object.
+      sampling_rate: Resample the audio to this sample rate.
+      split_stereo: Return separate left and right channels.
+
+    Returns:
+      A float32 Numpy array or a 2-tuple of arrays if split_stereo is True.
+    """
+    return await asyncio.to_thread(decode_audio, input_file, sampling_rate, split_stereo)
